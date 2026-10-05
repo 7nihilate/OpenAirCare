@@ -8,12 +8,13 @@ pub use makepad_widgets;
 
 mod hearing_test;
 mod settings;
+mod setup;
 mod tone;
 
 use std::sync::Arc;
 
-use airpods_link::session::{Command, ConnectionState, SessionEvent, SessionHandle, Snapshot};
-use airpods_link::Transport;
+use airpods_link::session::{Command, ConnectionState, SessionEvent, SessionHandle, SetupEvent, Snapshot};
+use airpods_link::{DeviceEntry, HostStatus, Transport};
 use airpods_proto::hearing::{Adjustments, Audiogram, BANDS_HZ, DB_HL_MAX, DB_HL_MIN};
 use airpods_proto::model;
 use airpods_proto::ListeningMode;
@@ -21,6 +22,7 @@ use makepad_widgets::*;
 
 use crate::hearing_test::{Presentation, TestRunner};
 use crate::settings::Settings;
+use crate::setup::{SetupAction, SetupDone};
 use crate::tone::{db_hl_to_amp, Ear, ToneShared, BURST_SECS};
 
 app_main!(App);
@@ -83,6 +85,7 @@ script_mod! {
                             width: Fit height: Fit
                             flow: Right
                             spacing: theme.space_2
+                            tab_setup := RadioButtonTab{text: "Setup"}
                             tab_status := RadioButtonTab{text: "Status"}
                             tab_hearing := RadioButtonTab{text: "Hearing Health"}
                             tab_test := RadioButtonTab{text: "Hearing Test"}
@@ -94,6 +97,55 @@ script_mod! {
                             width: Fill height: Fill
                             flow: Down
                             active_page: @page_status
+
+                            // ---------------------------------------------------- Setup
+                            page_setup := ScrollYView{
+                                width: Fill height: Fill
+                                flow: Down
+                                spacing: 8
+
+                                H3{text: "1. Bluetooth"}
+                                setup_bt_label := Label{width: Fill text: "Checking Bluetooth..."}
+                                Label{
+                                    width: Fill
+                                    text: "Set up Bluetooth asks for your password, then restarts Bluetooth: mice, keyboards and headphones on Bluetooth drop for a few seconds."
+                                }
+                                setup_apply_btn := Button{text: "Set up Bluetooth"}
+
+                                Hr{}
+                                H3{text: "2. AirPods"}
+                                setup_pair_label := Label{width: Fill text: ""}
+                                Label{
+                                    width: Fill
+                                    text: "To pair: put the AirPods in the case, leave the lid open, and hold the button on the back of the case until the light flashes white. Then search."
+                                }
+                                View{
+                                    width: Fill height: Fit
+                                    flow: Right
+                                    spacing: 8
+                                    setup_scan_btn := Button{text: "Search for AirPods"}
+                                    setup_forget_btn := Button{text: "Remove pairing"}
+                                }
+                                setup_found_0 := Button{visible: false text: ""}
+                                setup_found_1 := Button{visible: false text: ""}
+                                setup_found_2 := Button{visible: false text: ""}
+                                setup_pair_status := Label{width: Fill text: ""}
+
+                                Hr{}
+                                H3{text: "3. Connect"}
+                                Label{width: Fill text: "Wear the AirPods, open the Status tab and press Connect."}
+
+                                Hr{}
+                                View{
+                                    width: Fill height: Fit
+                                    flow: Right
+                                    spacing: 8
+                                    setup_check_btn := Button{text: "Check again"}
+                                    setup_menu_btn := Button{text: "Add to app menu"}
+                                    setup_undo_btn := Button{text: "Undo Bluetooth changes"}
+                                }
+                                setup_msg_label := Label{width: Fill text: ""}
+                            }
 
                             // ---------------------------------------------------- Status
                             page_status := ScrollYView{
@@ -516,6 +568,42 @@ pub struct App {
     /// xorshift state for the pre-tone delay (no `rand` dependency).
     #[rust]
     rng: u64,
+    /// Latest answer to `Command::CheckSetup`.
+    #[rust]
+    host: Option<HostStatus>,
+    /// The Setup tab was offered (or found unnecessary) once this launch.
+    #[rust]
+    setup_tab_decided: bool,
+    /// A password-prompt action (`setup::spawn`) is running.
+    #[rust]
+    setup_busy: bool,
+    #[rust]
+    scanning: bool,
+    #[rust]
+    pairing: bool,
+    /// Scan results behind the `setup_found_*` buttons.
+    #[rust]
+    found: Vec<DeviceEntry>,
+    /// The Apple identity was just set while AirPods were already paired:
+    /// they still hold the old identity and need pairing again.
+    #[rust]
+    repair_hint: bool,
+}
+
+/// Tab buttons with their pages, in display order.
+fn tabs() -> [(&'static [LiveId], LiveId); 6] {
+    [
+        (ids!(tab_setup), live_id!(page_setup)),
+        (ids!(tab_status), live_id!(page_status)),
+        (ids!(tab_hearing), live_id!(page_hearing)),
+        (ids!(tab_test), live_id!(page_test)),
+        (ids!(tab_audiogram), live_id!(page_audiogram)),
+        (ids!(tab_adjust), live_id!(page_adjust)),
+    ]
+}
+
+fn found_ids() -> [&'static [LiveId]; 3] {
+    [ids!(setup_found_0), ids!(setup_found_1), ids!(setup_found_2)]
 }
 
 fn left_ids() -> [&'static [LiveId]; 8] {
@@ -551,7 +639,14 @@ fn make_transport() -> Arc<dyn Transport> {
     #[cfg(feature = "mock")]
     {
         ::log::info!("using the mock AirPods transport");
-        return Arc::new(airpods_link::mock::MockTransport::new());
+        let mock = airpods_link::mock::MockTransport::new();
+        // Start like a computer that was never set up, to exercise the Setup tab.
+        if std::env::var_os("OPENAIRCARE_MOCK_FRESH").is_some() {
+            let mut st = mock.state.lock().unwrap();
+            st.paired = false;
+            st.apple_identity = false;
+        }
+        return Arc::new(mock);
     }
     #[allow(unreachable_code)]
     airpods_link::default_transport()
@@ -879,11 +974,193 @@ impl App {
         self.audiogram_to_ui(cx, ag);
         self.audiogram_dirty = true;
         self.ui.label(cx, ids!(ag_status_label)).set_text(cx, status);
+        self.show_tab(cx, live_id!(page_audiogram));
+    }
+
+    /// Switch to `page` from code, keeping the tab row in step.
+    fn show_tab(&mut self, cx: &mut Cx, page: LiveId) {
         // `set_active` does not deselect the sibling tabs.
-        for id in [ids!(tab_status), ids!(tab_hearing), ids!(tab_test), ids!(tab_audiogram), ids!(tab_adjust)] {
-            self.ui.radio_button(cx, id).set_active(cx, id == ids!(tab_audiogram), Animate::No);
+        for (tab, p) in tabs() {
+            self.ui.radio_button(cx, tab).set_active(cx, p == page, Animate::No);
         }
-        self.ui.page_flip(cx, ids!(pages)).set_active_page(cx, live_id!(page_audiogram));
+        self.ui.page_flip(cx, ids!(pages)).set_active_page(cx, page);
+        self.ui.redraw(cx);
+    }
+
+    // ---- setup ----
+
+    /// Open the Setup tab once per launch when something on it is still
+    /// to do. Waits for the disclaimer, which covers the window until then.
+    fn maybe_open_setup(&mut self, cx: &mut Cx) {
+        if self.setup_tab_decided || self.settings.disclaimer_accepted != Some(true) {
+            return;
+        }
+        let Some(host) = &self.host else { return };
+        self.setup_tab_decided = true;
+        if !host.ready() {
+            self.show_tab(cx, live_id!(page_setup));
+        }
+    }
+
+    fn set_setup_msg(&mut self, cx: &mut Cx, text: &str) {
+        self.ui.label(cx, ids!(setup_msg_label)).set_text(cx, text);
+    }
+
+    fn set_pair_status(&mut self, cx: &mut Cx, text: &str) {
+        self.ui.label(cx, ids!(setup_pair_status)).set_text(cx, text);
+    }
+
+    /// Start a `setup.sh` action; the result comes back as a [`SetupDone`] action.
+    fn run_setup_action(&mut self, cx: &mut Cx, action: SetupAction) {
+        self.setup_busy = true;
+        let waiting = match action {
+            SetupAction::DesktopEntry => "Adding OpenAirCare to the app menu...",
+            _ => "Waiting for your password...",
+        };
+        self.set_setup_msg(cx, waiting);
+        setup::spawn(action, |done| Cx::post_action(done));
+        self.update_setup_ui(cx);
+    }
+
+    fn on_setup_done(&mut self, cx: &mut Cx, done: SetupDone) {
+        self.setup_busy = false;
+        let text = match (done.action, done.result) {
+            (SetupAction::Apply { grant_access }, Ok(())) => {
+                let was_apple = self.host.as_ref().map(|h| h.apple_identity).unwrap_or(false);
+                let has_paired = self.host.as_ref().map(|h| !h.paired_airpods.is_empty()).unwrap_or(false);
+                self.repair_hint = !was_apple && has_paired;
+                self.send(Command::CheckSetup);
+                if grant_access {
+                    "Bluetooth is set up. Close OpenAirCare and open it again so it can use Bluetooth.".to_string()
+                } else {
+                    "Bluetooth is set up.".to_string()
+                }
+            }
+            (SetupAction::Undo, Ok(())) => {
+                self.repair_hint = false;
+                self.send(Command::CheckSetup);
+                "Bluetooth is back to how it was before setup. Pair the AirPods again if they stop connecting.".to_string()
+            }
+            (SetupAction::DesktopEntry, Ok(())) => "OpenAirCare is in the app menu.".to_string(),
+            (_, Err(e)) => e,
+        };
+        self.push_log(cx, format!("setup: {}", text.lines().next().unwrap_or_default()));
+        self.set_setup_msg(cx, &text);
+        self.update_setup_ui(cx);
+    }
+
+    fn on_setup_event(&mut self, cx: &mut Cx, ev: SetupEvent) {
+        match ev {
+            SetupEvent::Status(host) => {
+                if host.paired_airpods.is_empty() {
+                    self.repair_hint = false;
+                }
+                self.host = Some(host);
+                self.maybe_open_setup(cx);
+            }
+            SetupEvent::ScanResult(result) => {
+                self.scanning = false;
+                self.found.clear();
+                match result {
+                    Ok(devices) if devices.is_empty() => {
+                        self.set_pair_status(cx, "No AirPods found. Check that the case light is flashing white, then search again.");
+                    }
+                    Ok(devices) => {
+                        self.found = devices.into_iter().take(found_ids().len()).collect();
+                        self.set_pair_status(cx, "Press the AirPods you want to pair.");
+                    }
+                    Err(e) => self.set_pair_status(cx, &format!("The search failed: {e}")),
+                }
+            }
+            SetupEvent::PairResult { mac, result } => {
+                self.pairing = false;
+                match result {
+                    Ok(()) => {
+                        self.found.clear();
+                        self.repair_hint = false;
+                        self.set_pair_status(cx, "Paired. Wear the AirPods: OpenAirCare is connecting (see the Status tab).");
+                        self.push_log(cx, format!("paired with {mac}"));
+                        self.send(Command::Connect(Some(mac)));
+                    }
+                    Err(e) => self.set_pair_status(
+                        cx,
+                        &format!("{e}. Hold the case button until the light flashes white, then search again."),
+                    ),
+                }
+            }
+            SetupEvent::ForgetResult { mac, result } => match result {
+                Ok(()) => {
+                    self.push_log(cx, format!("removed the pairing with {mac}"));
+                    self.set_pair_status(cx, "Pairing removed. Put the AirPods in pairing mode, then search.");
+                }
+                Err(e) => self.set_pair_status(cx, &format!("Could not remove the pairing: {e}")),
+            },
+        }
+        self.update_setup_ui(cx);
+    }
+
+    /// Refresh the Setup tab from `host` and the scan / pairing state.
+    fn update_setup_ui(&mut self, cx: &mut Cx) {
+        let (bt_text, needs_apply, adapter_ok) = match &self.host {
+            None => ("Checking Bluetooth...".to_string(), false, false),
+            Some(h) => match (&h.adapter_error, h.apple_identity, &h.socket_error) {
+                (Some(e), _, _) => (
+                    format!("No Bluetooth adapter was found ({e}). Check that Bluetooth is installed (package bluez) and switched on, then press Check again."),
+                    false,
+                    false,
+                ),
+                (None, false, _) => (
+                    "To do: this computer does not identify as an Apple device yet. AirPods only open their Hearing Health settings to one.".to_string(),
+                    true,
+                    true,
+                ),
+                (None, true, Some(e)) => (
+                    format!("To do: OpenAirCare is not allowed to open a Bluetooth connection ({e})."),
+                    true,
+                    true,
+                ),
+                (None, true, None) => ("Done: Bluetooth identifies as an Apple device.".to_string(), false, true),
+            },
+        };
+        self.ui.label(cx, ids!(setup_bt_label)).set_text(cx, &bt_text);
+        self.ui.button(cx, ids!(setup_apply_btn)).set_enabled(cx, needs_apply && !self.setup_busy);
+        self.ui.button(cx, ids!(setup_undo_btn)).set_enabled(cx, !self.setup_busy);
+        self.ui.button(cx, ids!(setup_menu_btn)).set_enabled(cx, !self.setup_busy);
+
+        let paired = self.host.as_ref().map(|h| h.paired_airpods.clone()).unwrap_or_default();
+        let pair_text = if self.pairing {
+            "Pairing... keep the lid open.".to_string()
+        } else if self.scanning {
+            "Searching for about 15 seconds. Keep the lid open.".to_string()
+        } else if let Some(d) = paired.first() {
+            if self.repair_hint {
+                format!(
+                    "To do: {} ({}) was paired before this computer identified as Apple, and still remembers the old identity. Remove the pairing, then pair again.",
+                    d.name, d.mac
+                )
+            } else {
+                format!("Done: paired with {} ({}).", d.name, d.mac)
+            }
+        } else if adapter_ok {
+            "To do: no AirPods are paired with this computer yet.".to_string()
+        } else {
+            String::new()
+        };
+        self.ui.label(cx, ids!(setup_pair_label)).set_text(cx, &pair_text);
+        let idle = adapter_ok && !self.scanning && !self.pairing;
+        self.ui.button(cx, ids!(setup_scan_btn)).set_enabled(cx, idle);
+        self.ui.button(cx, ids!(setup_forget_btn)).set_enabled(cx, idle && !paired.is_empty());
+        for (i, id) in found_ids().iter().enumerate() {
+            let button = self.ui.button(cx, id);
+            match self.found.get(i) {
+                Some(d) => {
+                    button.set_text(cx, &format!("Pair {} ({})", d.name, d.mac));
+                    button.set_visible(cx, true);
+                    button.set_enabled(cx, idle);
+                }
+                None => button.set_visible(cx, false),
+            }
+        }
         self.ui.redraw(cx);
     }
 
@@ -1055,7 +1332,7 @@ impl App {
             }
         } else {
             format!(
-                "Hearing Health settings channel unavailable: {}\n\nChecklist: add `DeviceID = bluetooth:004C:0000:0000` to /etc/bluetooth/main.conf, restart bluetooth, re-pair the AirPods, and make sure no other Pods app is running.",
+"Hearing Health settings channel unavailable: {}\n\nOpen the Setup tab and finish the steps there, then pair the AirPods again. Close any other app that is talking to them.",
                 snap.att_error.clone().unwrap_or_default()
             )
         };
@@ -1134,12 +1411,14 @@ impl MatchEvent for App {
         }
         tone::install(cx, self.tone.clone());
         self.update_test_ui(cx);
+        self.update_setup_ui(cx);
 
         let emit: airpods_link::session::Emit = Arc::new(|e: SessionEvent| Cx::post_action(e));
         let handle = airpods_link::session::spawn(make_transport(), emit);
         if let Some(auto) = self.settings.auto_reconnect {
             handle.send(Command::SetAutoReconnect(auto));
         }
+        handle.send(Command::CheckSetup);
         // First launch: nothing talks to the buds until the disclaimer is
         // acknowledged. The modal cannot be dismissed and covers the UI.
         if self.settings.disclaimer_accepted == Some(true) {
@@ -1199,7 +1478,16 @@ impl MatchEvent for App {
                         let line = l.clone();
                         self.push_log(cx, line);
                     }
+                    SessionEvent::Setup(ev) => {
+                        let ev = ev.clone();
+                        self.on_setup_event(cx, ev);
+                    }
                 }
+            }
+            // ---- result of a `setup.sh` action ----
+            if let Some(done) = action.downcast_ref::<SetupDone>() {
+                let done = done.clone();
+                self.on_setup_done(cx, done);
             }
         }
         if got_snapshot {
@@ -1213,6 +1501,7 @@ impl MatchEvent for App {
             self.ui.modal(cx, ids!(disclaimer_modal)).close(cx);
             self.push_log(cx, "disclaimer acknowledged".into());
             self.send(Command::Connect(self.settings.device_mac.clone()));
+            self.maybe_open_setup(cx);
             self.ui.redraw(cx);
         }
         if self.ui.button(cx, ids!(disclaimer_decline_btn)).clicked(actions) {
@@ -1223,12 +1512,50 @@ impl MatchEvent for App {
         // ---- tabs ----
         if let Some(i) = self
             .ui
-            .radio_button_set(cx, ids_list!(tab_status, tab_hearing, tab_test, tab_audiogram, tab_adjust))
+            .radio_button_set(cx, ids_list!(tab_setup, tab_status, tab_hearing, tab_test, tab_audiogram, tab_adjust))
             .selected(cx, actions)
         {
-            let page = [live_id!(page_status), live_id!(page_hearing), live_id!(page_test), live_id!(page_audiogram), live_id!(page_adjust)][i];
+            let page = tabs()[i].1;
             self.ui.page_flip(cx, ids!(pages)).set_active_page(cx, page);
             self.ui.redraw(cx);
+        }
+
+        // ---- setup page ----
+        if self.ui.button(cx, ids!(setup_apply_btn)).clicked(actions) && !self.setup_busy {
+            let grant_access = self.host.as_ref().map(|h| h.socket_error.is_some()).unwrap_or(false);
+            self.run_setup_action(cx, SetupAction::Apply { grant_access });
+        }
+        if self.ui.button(cx, ids!(setup_undo_btn)).clicked(actions) && !self.setup_busy {
+            self.run_setup_action(cx, SetupAction::Undo);
+        }
+        if self.ui.button(cx, ids!(setup_menu_btn)).clicked(actions) && !self.setup_busy {
+            self.run_setup_action(cx, SetupAction::DesktopEntry);
+        }
+        if self.ui.button(cx, ids!(setup_check_btn)).clicked(actions) {
+            self.send(Command::CheckSetup);
+        }
+        if self.ui.button(cx, ids!(setup_scan_btn)).clicked(actions) && !self.scanning && !self.pairing {
+            self.scanning = true;
+            self.found.clear();
+            self.set_pair_status(cx, "");
+            self.send(Command::ScanForAirpods);
+            self.update_setup_ui(cx);
+        }
+        if self.ui.button(cx, ids!(setup_forget_btn)).clicked(actions) && !self.scanning && !self.pairing {
+            let paired = self.host.as_ref().map(|h| h.paired_airpods.clone()).unwrap_or_default();
+            for d in paired {
+                self.send(Command::Forget(d.mac));
+            }
+        }
+        for (i, id) in found_ids().iter().enumerate() {
+            if self.ui.button(cx, id).clicked(actions) && !self.pairing {
+                if let Some(d) = self.found.get(i).cloned() {
+                    self.pairing = true;
+                    self.set_pair_status(cx, "");
+                    self.send(Command::Pair(d.mac));
+                    self.update_setup_ui(cx);
+                }
+            }
         }
 
         // ---- status page ----

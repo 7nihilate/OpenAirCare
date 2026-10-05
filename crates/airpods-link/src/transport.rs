@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
-    #[error("no paired AirPods found (pair them via Bluetooth settings first)")]
+    #[error("no paired AirPods found (pair them on the Setup tab first)")]
     NoDevice,
     #[error("adapter error: {0}")]
     Adapter(String),
@@ -40,6 +40,42 @@ pub struct DeviceEntry {
     pub connected: bool,
     /// Advertises the AACP service UUID.
     pub is_airpods: bool,
+    /// Bonded with this host (a device seen in a scan is listed but not paired).
+    pub paired: bool,
+}
+
+/// What the Setup tab needs to know about this computer's Bluetooth.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostStatus {
+    /// `None` when a Bluetooth adapter was found, otherwise why not.
+    pub adapter_error: Option<String>,
+    pub powered: bool,
+    /// The adapter advertises Apple's vendor ID (`DeviceID = bluetooth:004C:...`).
+    /// AirPods refuse the Hearing Health channel (PSM 31) without it.
+    pub apple_identity: bool,
+    /// Set when this process is not allowed to open an L2CAP socket.
+    pub socket_error: Option<String>,
+    pub paired_airpods: Vec<DeviceEntry>,
+}
+
+impl HostStatus {
+    /// Nothing left to do on the Setup tab.
+    pub fn ready(&self) -> bool {
+        self.adapter_error.is_none()
+            && self.apple_identity
+            && self.socket_error.is_none()
+            && !self.paired_airpods.is_empty()
+    }
+}
+
+/// Same rule as `setup.sh`: the AACP UUID is only known once BlueZ has
+/// talked to the device, so fall back to the name.
+pub fn looks_like_airpods(d: &DeviceEntry) -> bool {
+    d.is_airpods || d.name.to_ascii_lowercase().contains("airpods")
+}
+
+fn unsupported<T>() -> Result<T, LinkError> {
+    Err(LinkError::Other("not supported by this Bluetooth backend".into()))
 }
 
 /// One open L2CAP channel.
@@ -70,4 +106,27 @@ pub trait Transport: Send + Sync {
     /// refusing PSM 31 once they closed it themselves until the link is
     /// re-established; the session calls this as a last resort.
     fn bounce<'a>(&'a self, mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>>;
+
+    /// Check the adapter, the Apple identity and the pairing for the Setup tab.
+    fn host_status(&self) -> BoxFuture<'_, HostStatus> {
+        Box::pin(async {
+            HostStatus { adapter_error: Some("not supported by this Bluetooth backend".into()), ..Default::default() }
+        })
+    }
+
+    /// Discover nearby devices for `secs` seconds and return the unpaired
+    /// ones that look like AirPods (or, failing that, anything newly seen).
+    fn scan(&self, _secs: u64) -> BoxFuture<'_, Result<Vec<DeviceEntry>, LinkError>> {
+        Box::pin(async { unsupported() })
+    }
+
+    /// Pair with, trust and connect to `mac`.
+    fn pair<'a>(&'a self, _mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async { unsupported() })
+    }
+
+    /// Remove the pairing with `mac`.
+    fn forget<'a>(&'a self, _mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async { unsupported() })
+    }
 }

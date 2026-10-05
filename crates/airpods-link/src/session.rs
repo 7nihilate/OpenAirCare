@@ -23,7 +23,7 @@ use log::{debug, error, info as linfo, warn};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Instant};
 
-use crate::transport::{DeviceEntry, Link, LinkError, Transport};
+use crate::transport::{DeviceEntry, HostStatus, Link, LinkError, Transport};
 
 /// Debounce for hearing-aid characteristic writes.
 pub const WRITE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -34,6 +34,8 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// previous one; retry PSM 31 a few times before giving up on it.
 const ATT_RETRY_DELAY: Duration = Duration::from_secs(3);
 const ATT_RETRIES: u32 = 5;
+/// How long "Search for AirPods" on the Setup tab keeps discovery running.
+const SCAN_SECS: u64 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -71,6 +73,16 @@ pub struct Snapshot {
 pub enum SessionEvent {
     Snapshot(Snapshot),
     Log(String),
+    Setup(SetupEvent),
+}
+
+/// Answers to the Setup-tab commands. Errors are already worded for the user.
+#[derive(Debug, Clone)]
+pub enum SetupEvent {
+    Status(HostStatus),
+    ScanResult(Result<Vec<DeviceEntry>, String>),
+    PairResult { mac: String, result: Result<(), String> },
+    ForgetResult { mac: String, result: Result<(), String> },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +103,14 @@ pub enum Command {
     /// Re-read the hearing-aid characteristic.
     Reload,
     SetAutoReconnect(bool),
+    /// Setup tab: report the adapter / Apple identity / pairing state.
+    CheckSetup,
+    /// Setup tab: look for AirPods in pairing mode.
+    ScanForAirpods,
+    /// Setup tab: pair with this MAC. Closes the current links first.
+    Pair(String),
+    /// Setup tab: remove the pairing with this MAC. Closes the current links first.
+    Forget(String),
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +297,39 @@ impl Session {
                 }
                 Err(e) => self.log(format!("device list failed: {e}")),
             },
+            // The setup commands run as their own tasks: a scan or a pairing
+            // takes many seconds and must not stall the links.
+            Command::CheckSetup => {
+                let (t, emit) = (self.transport.clone(), self.emit.clone());
+                tokio::spawn(async move {
+                    emit(SessionEvent::Setup(SetupEvent::Status(t.host_status().await)));
+                });
+            }
+            Command::ScanForAirpods => {
+                let (t, emit) = (self.transport.clone(), self.emit.clone());
+                tokio::spawn(async move {
+                    let result = t.scan(SCAN_SECS).await.map_err(|e| e.to_string());
+                    emit(SessionEvent::Setup(SetupEvent::ScanResult(result)));
+                });
+            }
+            Command::Pair(mac) => {
+                self.release_for_setup("pairing");
+                let (t, emit) = (self.transport.clone(), self.emit.clone());
+                tokio::spawn(async move {
+                    let result = t.pair(&mac).await.map_err(|e| e.to_string());
+                    emit(SessionEvent::Setup(SetupEvent::PairResult { mac, result }));
+                    emit(SessionEvent::Setup(SetupEvent::Status(t.host_status().await)));
+                });
+            }
+            Command::Forget(mac) => {
+                self.release_for_setup("removing the pairing");
+                let (t, emit) = (self.transport.clone(), self.emit.clone());
+                tokio::spawn(async move {
+                    let result = t.forget(&mac).await.map_err(|e| e.to_string());
+                    emit(SessionEvent::Setup(SetupEvent::ForgetResult { mac, result }));
+                    emit(SessionEvent::Setup(SetupEvent::Status(t.host_status().await)));
+                });
+            }
             Command::SetHearingAid(on) => self.set_hearing_aid(on).await,
             Command::SetListeningMode(mode) => {
                 self.send_control(ControlCommandId::ListeningMode, &control::listening_mode(mode)).await;
@@ -563,7 +616,7 @@ impl Session {
                 return Ok(d.clone());
             }
             // Not in the list (e.g. transport without discovery): try anyway.
-            return Ok(DeviceEntry { mac, name: "AirPods".into(), connected: true, is_airpods: true });
+            return Ok(DeviceEntry { mac, name: "AirPods".into(), connected: true, is_airpods: true, paired: true });
         }
         // Prefer AirPods BlueZ already has an ACL link to, but fall back to
         // any paired pair: opening the L2CAP socket pages the device itself,
@@ -642,6 +695,14 @@ impl Session {
         self.snap.last_error = Some(msg.clone());
         self.set_state(ConnectionState::Error(msg));
         self.schedule_reconnect();
+    }
+
+    /// Drop the links and any pending retry so the session does not page
+    /// the buds while they are being paired or removed.
+    fn release_for_setup(&mut self, why: &str) {
+        self.reconnect_at = None;
+        self.disconnect(why);
+        self.set_state(ConnectionState::Disconnected);
     }
 
     fn disconnect(&mut self, why: &str) {

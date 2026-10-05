@@ -20,6 +20,8 @@ audio profile settings that AirPods Pro 2 / AirPods Pro 3 already expose over
 Bluetooth. It adds no audio processing of its own; it only relays settings to
 the earbuds' firmware.
 
+To install a prebuilt app, download a [release](https://github.com/brettpreston/OpenAirCare/releases), unpack it, and open `openaircare`. Its **Setup** tab configures Bluetooth and pairs the AirPods; `./setup.sh` does the same from a terminal and also installs missing libraries. See [SETUP.md](SETUP.md). Building from source is under [Build & run](#build--run).
+
 - toggle the earbuds' built-in transparency audio profile — shown in the app
   as **Hearing Health** (Apple labels this setting "Hearing Aid") — plus the
   listening-mode selector, because the profile only applies in Transparency
@@ -114,8 +116,10 @@ openaircare/
 2. Your AirPods paired and **connected** as an audio device the normal way
    (`bluetoothctl connect XX:XX:...` or the desktop Bluetooth settings).
 3. **Vendor-ID spoofing.** AirPods only expose the Hearing Health channel to
-   hosts that identify as Apple. Add to `/etc/bluetooth/main.conf` under
-   `[General]`:
+   hosts that identify as Apple. The app's Setup tab sets this and pairs the
+   earbuds (`./setup.sh` does the same and installs the runtime libraries).
+   By hand, add to
+   `/etc/bluetooth/main.conf` under `[General]`:
 
    ```ini
    DeviceID = bluetooth:004C:0000:0000
@@ -158,6 +162,7 @@ Environment knobs:
 | `RUST_LOG=debug` | log every AACP/ATT packet (hex) to stderr |
 | `MAKEPAD_GPU=gl` | force the OpenGL ES backend if Vulkan misbehaves |
 | `MAKEPAD=linux_direct` (build-time) | render straight to DRM/KMS without X11/Wayland (kiosk Pi) |
+| `OPENAIRCARE_MOCK_FRESH=1` | with `--features mock`: start as a computer that was never set up, to try the Setup tab |
 | `OPENAIRCARE_ATT_SCAN=1` | "Reload from AirPods" also reads ATT handles 0x0001-0x0060 and logs them (find where a firmware keeps a value; diff two runs) |
 
 Settings (last audiogram / adjustments) are stored in
@@ -199,8 +204,8 @@ about 5 minutes on a Pi 5 (8 GB); the debug build of makepad about 10.
   state in their initial dump on the next connect (Disconnect / Connect on
   the Status page to double check). The first enable also flips the
   "enrolled" flag on the buds permanently, like the Android app does.
-- **`Connection refused` on PSM 31** - the `DeviceID` line is missing, the
-  bluetooth service was not restarted, or the AirPods were not re-paired.
+- **`Connection refused` on PSM 31** - open the Setup tab: Bluetooth has to
+  show as done, and the AirPods have to be paired after that step.
   If it *used* to work in this session, the buds are still holding the ATT
   slot of a previous client (another script, a killed app): the app retries
   PSM 31 five times, and if that is not enough, bounce the link once with
@@ -208,12 +213,14 @@ about 5 minutes on a Pi 5 (8 GB); the debug build of makepad about 10.
   app reconnects on its own.
 - **AirPods disconnect after a while when spoofing the Device ID** - known
   upstream quirk (the buds expect more Apple-specific traffic). The app
-  reconnects automatically; when you are done configuring, remove the
-  `DeviceID` line again.
-- **`Permission denied` creating the L2CAP socket** - some distros restrict
-  raw Bluetooth sockets; run once with `sudo` to confirm, then either add your
-  user to the `bluetooth` group or `setcap cap_net_raw,cap_net_admin+eip` on
-  the binary.
+  reconnects automatically; when you are done configuring, press *Undo
+  Bluetooth changes* on the Setup tab, or run `./setup.sh --undo` (or remove
+  the `DeviceID` line and restart Bluetooth).
+- **`Permission denied` creating the L2CAP socket** - run `./setup.sh` again.
+  It grants the app Bluetooth access (`setcap`) and adds your user to the
+  `bluetooth` group. The group applies the next time you log in. Move the
+  app into your home directory if it is on a USB stick. Those disks ignore
+  the Bluetooth permission the script sets on the file.
 - **Wrong device picked** - the app connects to the first *connected* device
   advertising the AACP UUID `74ec2172-0bad-4d01-8f77-997b2be0722a`. Use the
   MAC field on the Status page to force a specific one.

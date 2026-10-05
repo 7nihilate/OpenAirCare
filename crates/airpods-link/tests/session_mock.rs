@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airpods_link::mock::{MockTransport, MOCK_MAC};
-use airpods_link::session::{self, Command, ConnectionState, SessionEvent, Snapshot};
+use airpods_link::session::{self, Command, ConnectionState, SessionEvent, SetupEvent, Snapshot};
 use airpods_proto::aacp::{control, handshake};
 use airpods_proto::att;
 use airpods_proto::hearing::{Adjustments, Audiogram, HearingAidData};
@@ -15,6 +15,7 @@ struct Harness {
     cmd: mpsc::UnboundedSender<Command>,
     snaps: Arc<Mutex<Vec<Snapshot>>>,
     logs: Arc<Mutex<Vec<String>>>,
+    setup: Arc<Mutex<Vec<SetupEvent>>>,
 }
 
 impl Harness {
@@ -22,15 +23,17 @@ impl Harness {
         let mock = MockTransport::new();
         let snaps: Arc<Mutex<Vec<Snapshot>>> = Default::default();
         let logs: Arc<Mutex<Vec<String>>> = Default::default();
-        let (s2, l2) = (snaps.clone(), logs.clone());
+        let setup: Arc<Mutex<Vec<SetupEvent>>> = Default::default();
+        let (s2, l2, u2) = (snaps.clone(), logs.clone(), setup.clone());
         let emit: session::Emit = Arc::new(move |e| match e {
             SessionEvent::Snapshot(s) => s2.lock().unwrap().push(s),
             SessionEvent::Log(l) => l2.lock().unwrap().push(l),
+            SessionEvent::Setup(u) => u2.lock().unwrap().push(u),
         });
         let (cmd, rx) = mpsc::unbounded_channel();
         let transport: Arc<dyn airpods_link::Transport> = Arc::new(mock.clone());
         tokio::spawn(session::run(transport, emit, rx));
-        Self { mock, cmd, snaps, logs }
+        Self { mock, cmd, snaps, logs, setup }
     }
 
     fn last(&self) -> Snapshot {
@@ -41,6 +44,16 @@ impl Harness {
     /// on are considered.
     fn mark(&self) -> usize {
         self.snaps.lock().unwrap().len()
+    }
+
+    async fn wait_setup<T>(&self, what: &str, f: impl Fn(&SetupEvent) -> Option<T>) -> T {
+        for _ in 0..3000 {
+            if let Some(v) = self.setup.lock().unwrap().iter().rev().find_map(|e| f(e)) {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}\nsetup events: {:?}", self.setup.lock().unwrap());
     }
 
     async fn wait_until(&self, what: &str, f: impl Fn(&Snapshot) -> bool) -> Snapshot {
@@ -290,4 +303,61 @@ async fn att_closed_by_device_is_reopened() {
     h.wait_from(mark, "att closed", |s| !s.att_ok).await;
     let s = h.wait_from(mark, "att reopened", |s| s.att_ok).await;
     assert_eq!(s.state, ConnectionState::Connected);
+}
+
+#[tokio::test]
+async fn check_setup_reports_host_status() {
+    let h = Harness::start();
+    h.mock.state.lock().unwrap().apple_identity = false;
+    h.cmd.send(Command::CheckSetup).unwrap();
+    let st = h
+        .wait_setup("status", |e| match e {
+            SetupEvent::Status(s) => Some(s.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(!st.apple_identity);
+    assert!(!st.ready());
+    assert_eq!(st.paired_airpods[0].mac, MOCK_MAC);
+}
+
+#[tokio::test]
+async fn forget_scan_and_pair_round_trip() {
+    let h = Harness::start();
+    h.cmd.send(Command::Connect(None)).unwrap();
+    h.wait_until("connected", |s| s.state == ConnectionState::Connected).await;
+
+    // Removing the pairing drops the links first and reports the new status.
+    let mark = h.mark();
+    h.cmd.send(Command::Forget(MOCK_MAC.into())).unwrap();
+    h.wait_from(mark, "disconnected", |s| s.state == ConnectionState::Disconnected).await;
+    h.wait_setup("unpaired status", |e| match e {
+        SetupEvent::Status(s) if s.paired_airpods.is_empty() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    h.cmd.send(Command::ScanForAirpods).unwrap();
+    let found = h
+        .wait_setup("scan result", |e| match e {
+            SetupEvent::ScanResult(Ok(d)) => Some(d.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(found.len(), 1);
+    assert!(!found[0].paired);
+
+    h.cmd.send(Command::Pair(found[0].mac.clone())).unwrap();
+    h.wait_setup("paired", |e| match e {
+        SetupEvent::PairResult { result: Ok(()), .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    let st = h
+        .wait_setup("ready status", |e| match e {
+            SetupEvent::Status(s) if s.ready() => Some(s.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(st.paired_airpods[0].mac, MOCK_MAC);
 }

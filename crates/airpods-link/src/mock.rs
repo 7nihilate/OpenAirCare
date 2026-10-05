@@ -11,7 +11,7 @@ use airpods_proto::att::{self, pdu, AttPdu};
 use airpods_proto::hearing::{self, HearingAidData};
 use tokio::sync::mpsc;
 
-use crate::transport::{BoxFuture, DeviceEntry, Link, LinkError, Transport};
+use crate::transport::{BoxFuture, DeviceEntry, HostStatus, Link, LinkError, Transport};
 
 pub const MOCK_MAC: &str = "AA:BB:CC:DD:EE:FF";
 pub const MOCK_MODEL: &str = "A3048";
@@ -42,6 +42,10 @@ pub struct MockState {
     /// Echo control commands back (older firmware does; AirPods Pro 3 on
     /// firmware 8A silently apply 0x2C/0x33 without echoing).
     pub echo_controls: bool,
+    /// The fake AirPods are bonded with the host (`forget` / `pair` flip it).
+    pub paired: bool,
+    /// What `host_status()` reports for the Apple vendor ID.
+    pub apple_identity: bool,
 }
 
 impl Default for MockState {
@@ -70,6 +74,8 @@ impl Default for MockState {
             aacp_dev_tx: None,
             att_dev_tx: None,
             echo_controls: true,
+            paired: true,
+            apple_identity: true,
         }
     }
 }
@@ -93,6 +99,17 @@ impl MockTransport {
             .filter(|(p, _)| *p == psm)
             .map(|(_, d)| d.clone())
             .collect()
+    }
+
+    fn entry(&self) -> DeviceEntry {
+        let st = self.state.lock().unwrap();
+        DeviceEntry {
+            mac: MOCK_MAC.into(),
+            name: "Mock AirPods Pro".into(),
+            connected: st.reported_connected,
+            is_airpods: true,
+            paired: st.paired,
+        }
     }
 
     fn info_packet() -> Vec<u8> {
@@ -122,14 +139,48 @@ impl Transport for MockTransport {
     }
 
     fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceEntry>, LinkError>> {
+        Box::pin(async { Ok(vec![self.entry()]) })
+    }
+
+    fn host_status(&self) -> BoxFuture<'_, HostStatus> {
         Box::pin(async {
-            let connected = self.state.lock().unwrap().reported_connected;
-            Ok(vec![DeviceEntry {
-                mac: MOCK_MAC.into(),
-                name: "Mock AirPods Pro".into(),
-                connected,
-                is_airpods: true,
-            }])
+            let entry = self.entry();
+            HostStatus {
+                adapter_error: None,
+                powered: true,
+                apple_identity: self.state.lock().unwrap().apple_identity,
+                socket_error: None,
+                paired_airpods: if entry.paired { vec![entry] } else { vec![] },
+            }
+        })
+    }
+
+    fn scan(&self, _secs: u64) -> BoxFuture<'_, Result<Vec<DeviceEntry>, LinkError>> {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let entry = self.entry();
+            Ok(if entry.paired { vec![] } else { vec![entry] })
+        })
+    }
+
+    fn pair<'a>(&'a self, mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async move {
+            if mac != MOCK_MAC {
+                return Err(LinkError::NoDevice);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            self.state.lock().unwrap().paired = true;
+            Ok(())
+        })
+    }
+
+    fn forget<'a>(&'a self, mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async move {
+            if mac != MOCK_MAC {
+                return Err(LinkError::NoDevice);
+            }
+            self.state.lock().unwrap().paired = false;
+            Ok(())
         })
     }
 

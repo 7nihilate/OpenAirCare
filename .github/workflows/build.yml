@@ -42,7 +42,9 @@ jobs:
           key: ${{ matrix.arch }}
 
       - name: Test
-        run: cargo test --workspace --features airpods-link/mock
+        run: |
+          cargo test --workspace --features airpods-link/mock
+          bash setup.sh --self-test
 
       - name: Build release
         run: cargo build -p openaircare --release --locked
@@ -51,7 +53,7 @@ jobs:
         run: |
           name=openaircare-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-linux-${{ matrix.arch }}
           mkdir "$name"
-          cp target/release/openaircare README.md "$name/"
+          cp target/release/openaircare README.md SETUP.md setup.sh "$name/"
           tar czf "$name.tar.gz" "$name"
           echo "PKG=$name.tar.gz" >> "$GITHUB_ENV"
 

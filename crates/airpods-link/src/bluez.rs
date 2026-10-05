@@ -12,8 +12,12 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Instant};
 
-use crate::transport::{BoxFuture, DeviceEntry, Link, LinkError, Transport};
+use crate::transport::{looks_like_airpods, BoxFuture, DeviceEntry, HostStatus, Link, LinkError, Transport};
 
+/// Apple's Bluetooth SIG company ID, as set by `DeviceID = bluetooth:004C:...`.
+const APPLE_VENDOR_ID: u32 = 0x004C;
+/// Pairing waits on the user (case button) and on the buds.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RECV_BUF: usize = 2048;
@@ -37,11 +41,38 @@ Remove them in Bluetooth settings (bluetoothctl remove <MAC>) and pair again"
         Some(112) => "the AirPods did not answer (in the case, out of range, or asleep)".into(),
         Some(110) => "timed out waiting for the AirPods".into(),
         // PSM 31 without the Apple vendor ID, or a second AACP client.
-        Some(111) => "connection refused by the AirPods (for PSM 31: is `DeviceID = bluetooth:004C:0000:0000` set? \
-for AACP: is another LibrePods app running?)"
-            .into(),
+        Some(111) => "connection refused by the AirPods (Hearing Health channel closed, or another app is using it)".into(),
         _ => e.to_string(),
     }
+}
+
+fn adapter_err(e: bluer::Error) -> LinkError {
+    LinkError::Adapter(e.to_string())
+}
+
+async fn default_adapter() -> Result<bluer::Adapter, LinkError> {
+    let session = bluer::Session::new().await.map_err(adapter_err)?;
+    session.default_adapter().await.map_err(adapter_err)
+}
+
+fn parse_addr(mac: &str) -> Result<Address, LinkError> {
+    mac.parse::<Address>().map_err(|e| LinkError::Other(format!("bad address {mac}: {e}")))
+}
+
+/// Every device BlueZ knows about, paired or only seen in a scan.
+async fn known_devices(adapter: &bluer::Adapter) -> Result<Vec<DeviceEntry>, LinkError> {
+    let target = Uuid::parse_str(airpods_proto::aacp::SERVICE_UUID).map_err(|e| LinkError::Other(e.to_string()))?;
+    let addrs = adapter.device_addresses().await.map_err(adapter_err)?;
+    let mut out = Vec::new();
+    for addr in addrs {
+        let Ok(device) = adapter.device(addr) else { continue };
+        let name = device.alias().await.unwrap_or_else(|_| addr.to_string());
+        let connected = device.is_connected().await.unwrap_or(false);
+        let paired = device.is_paired().await.unwrap_or(false);
+        let is_airpods = matches!(device.uuids().await, Ok(Some(uuids)) if uuids.contains(&target));
+        out.push(DeviceEntry { mac: addr.to_string(), name, connected, is_airpods, paired });
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -60,22 +91,94 @@ impl Transport for BluezTransport {
 
     fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceEntry>, LinkError>> {
         Box::pin(async {
-            let target = Uuid::parse_str(airpods_proto::aacp::SERVICE_UUID)
-                .map_err(|e| LinkError::Other(e.to_string()))?;
-            let session = bluer::Session::new().await.map_err(|e| LinkError::Adapter(e.to_string()))?;
-            let adapter = session.default_adapter().await.map_err(|e| LinkError::Adapter(e.to_string()))?;
-            let addrs = adapter.device_addresses().await.map_err(|e| LinkError::Adapter(e.to_string()))?;
-            let mut out = Vec::new();
-            for addr in addrs {
-                let Ok(device) = adapter.device(addr) else { continue };
-                let name = device.alias().await.unwrap_or_else(|_| addr.to_string());
-                let connected = device.is_connected().await.unwrap_or(false);
-                let is_airpods = matches!(device.uuids().await, Ok(Some(uuids)) if uuids.contains(&target));
-                out.push(DeviceEntry { mac: addr.to_string(), name, connected, is_airpods });
-            }
+            let adapter = default_adapter().await?;
+            let mut out = known_devices(&adapter).await?;
             // AirPods first, then connected devices.
             out.sort_by_key(|d| (!d.is_airpods, !d.connected));
             Ok(out)
+        })
+    }
+
+    fn host_status(&self) -> BoxFuture<'_, HostStatus> {
+        Box::pin(async {
+            let mut st = HostStatus::default();
+            // Only a permission problem is a setup matter; anything else
+            // shows up when connecting.
+            if let Err(e) = Socket::<bluer::l2cap::SeqPacket>::new_seq_packet() {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    st.socket_error = Some(e.to_string());
+                }
+            }
+            let adapter = match default_adapter().await {
+                Ok(a) => a,
+                Err(e) => {
+                    st.adapter_error = Some(e.to_string());
+                    return st;
+                }
+            };
+            st.powered = adapter.is_powered().await.unwrap_or(false);
+            st.apple_identity = matches!(adapter.modalias().await, Ok(Some(m)) if m.vendor == APPLE_VENDOR_ID);
+            if let Ok(devs) = known_devices(&adapter).await {
+                st.paired_airpods = devs.into_iter().filter(|d| d.paired && looks_like_airpods(d)).collect();
+            }
+            st
+        })
+    }
+
+    fn scan(&self, secs: u64) -> BoxFuture<'_, Result<Vec<DeviceEntry>, LinkError>> {
+        Box::pin(async move {
+            let adapter = default_adapter().await?;
+            if !adapter.is_powered().await.unwrap_or(false) {
+                adapter.set_powered(true).await.map_err(adapter_err)?;
+            }
+            let before: Vec<String> = known_devices(&adapter).await?.into_iter().map(|d| d.mac).collect();
+            info!("scanning for {secs} s");
+            {
+                // Discovery runs while this stream is alive; bluetoothd
+                // records what it finds, so the events are not needed.
+                let _discovery = adapter.discover_devices().await.map_err(adapter_err)?;
+                sleep(Duration::from_secs(secs)).await;
+            }
+            let found: Vec<DeviceEntry> = known_devices(&adapter).await?.into_iter().filter(|d| !d.paired).collect();
+            let airpods: Vec<DeviceEntry> = found.iter().filter(|d| looks_like_airpods(d)).cloned().collect();
+            if !airpods.is_empty() {
+                return Ok(airpods);
+            }
+            Ok(found.into_iter().filter(|d| !before.contains(&d.mac)).collect())
+        })
+    }
+
+    fn pair<'a>(&'a self, mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async move {
+            let addr = parse_addr(mac)?;
+            let adapter = default_adapter().await?;
+            let device = adapter.device(addr).map_err(adapter_err)?;
+            info!("pairing with {addr}");
+            if !device.is_paired().await.unwrap_or(false) {
+                match timeout(PAIR_TIMEOUT, device.pair()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(LinkError::Other(format!("pairing failed: {e}"))),
+                    Err(_) => return Err(LinkError::Other("pairing timed out".into())),
+                }
+            }
+            if let Err(e) = device.set_trusted(true).await {
+                warn!("could not trust {addr}: {e}");
+            }
+            // Best effort: the audio profiles may fail on a host without
+            // A2DP, and the session pages the buds itself anyway.
+            if let Ok(Err(e)) = timeout(CONNECT_TIMEOUT, device.connect()).await {
+                debug!("connect after pairing: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    fn forget<'a>(&'a self, mac: &'a str) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async move {
+            let addr = parse_addr(mac)?;
+            let adapter = default_adapter().await?;
+            info!("removing pairing with {addr}");
+            adapter.remove_device(addr).await.map_err(adapter_err)
         })
     }
 

@@ -14,8 +14,8 @@ pub mod bluez;
 #[cfg(feature = "mock")]
 pub mod mock;
 
-pub use session::{Command, ConnectionState, SessionEvent, SessionHandle, Snapshot};
-pub use transport::{DeviceEntry, LinkError, Transport};
+pub use session::{Command, ConnectionState, SessionEvent, SessionHandle, SetupEvent, Snapshot};
+pub use transport::{DeviceEntry, HostStatus, LinkError, Transport};
 
 /// Pick the default transport for this platform. Returns `None` when there is
 /// no real transport (non-Linux builds), in which case callers should fall
