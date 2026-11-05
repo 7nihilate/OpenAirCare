@@ -94,8 +94,11 @@ Inc. Other product names are used only to describe hardware compatibility.
 
 # Screenshots
 
+<img width="600" height="820" alt="Setup tab" src="screenshots/setup.png" />
 <img width="600" height="820" alt="Status tab" src="screenshots/status.png" />
 <img width="600" height="820" alt="Hearing Health tab" src="screenshots/hearing-health.png" />
+<img width="600" height="820" alt="Hearing Test tab" src="screenshots/hearing-test.png" />
+<img width="600" height="820" alt="Hearing Test tab, manual mode" src="screenshots/hearing-test-manual.png" />
 <img width="600" height="820" alt="Audiogram tab" src="screenshots/audiogram.png" />
 <img width="600" height="820" alt="Adjustments tab" src="screenshots/adjustments.png" />
 
