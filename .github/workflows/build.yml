@@ -53,7 +53,7 @@ jobs:
         run: |
           name=openaircare-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-linux-${{ matrix.arch }}
           mkdir "$name"
-          cp target/release/openaircare README.md SETUP.md setup.sh "$name/"
+          cp target/release/openaircare README.md SETUP.md LICENSE setup.sh "$name/"
           tar czf "$name.tar.gz" "$name"
           echo "PKG=$name.tar.gz" >> "$GITHUB_ENV"
 

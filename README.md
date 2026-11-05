@@ -227,3 +227,7 @@ about 5 minutes on a Pi 5 (8 GB); the debug build of makepad about 10.
 
 ## Shoutout
 Librepods - check out their repo https://github.com/librepods-org/librepods
+
+## License
+
+OpenAirCare is licensed under the [GNU Affero General Public License v3.0](LICENSE).
