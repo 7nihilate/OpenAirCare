@@ -228,9 +228,6 @@ about 5 minutes on a Pi 5 (8 GB); the debug build of makepad about 10.
   advertising the AACP UUID `74ec2172-0bad-4d01-8f77-997b2be0722a`. Use the
   MAC field on the Status page to force a specific one.
 
-## Shoutout
-Librepods - check out their repo https://github.com/librepods-org/librepods
-
 ## License
 
 OpenAirCare is licensed under the [GNU Affero General Public License v3.0](LICENSE).
